@@ -124,3 +124,4 @@ export * from "./utils/traefik/web-server";
 export * from "./utils/volume-backups/index";
 export * from "./utils/watch-paths/should-deploy";
 export * from "./wss/utils";
+export * from "./services/portainer";

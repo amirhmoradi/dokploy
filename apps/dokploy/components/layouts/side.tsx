@@ -14,6 +14,7 @@ import {
 	Clock,
 	CreditCard,
 	Database,
+	FileInput,
 	Folder,
 	Forward,
 	GalleryVerticalEnd,
@@ -388,6 +389,15 @@ const MENU: Menu = {
 			// Only enabled for admins
 			isEnabled: ({ auth }) =>
 				!!(auth?.role === "owner" || auth?.role === "admin"),
+		},
+		{
+			isSingle: true,
+			title: "Portainer Migration",
+			url: "/dashboard/settings/portainer-migration",
+			icon: FileInput,
+			// Only enabled for admins in non-cloud environments
+			isEnabled: ({ auth, isCloud }) =>
+				!!((auth?.role === "owner" || auth?.role === "admin") && !isCloud),
 		},
 		{
 			isSingle: true,
