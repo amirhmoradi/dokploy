@@ -38,3 +38,12 @@ export * from "./plugin-service.js";
 // v2.0.0 - Multi-Platform
 export * from "./coolify-adapter.js";
 export * from "./caprover-adapter.js";
+
+// v1.1.0 - Parallel Migration
+export * from "./parallel-migration-service.js";
+
+// v1.2.0 - Team/User Migration
+export * from "./team-migration-service.js";
+
+// v1.2.0 - Multi-Instance Support
+export * from "./multi-instance-service.js";
