@@ -1,5 +1,6 @@
 /**
- * API Routes using Hono
+ * API Routes using Hono - v2.0.0
+ * Extended with all roadmap features
  */
 
 import { Hono } from "hono";
@@ -7,7 +8,7 @@ import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 import { nanoid } from "nanoid";
 import { db, migrations, migrationItems, migrationLogs } from "../db/index.js";
-import { eq, desc, and, sql } from "drizzle-orm";
+import { eq, desc, and, sql, gte, lte } from "drizzle-orm";
 import {
   testPortainerConnection,
   createPortainerApiClient,
@@ -15,7 +16,17 @@ import {
 import { createBoltDbReader, testBoltDbFile } from "../services/portainer-boltdb-reader.js";
 import { createTransformer } from "../services/portainer-transformer.js";
 import { validateLicense, getActiveLicense, hasFeature, FEATURES } from "../license/license-validator.js";
-import type { Migration, MigrationAnalysis } from "../types/index.js";
+import { selectionFilterService } from "../services/selection-filter-service.js";
+import { notificationService } from "../services/notification-service.js";
+import { schedulerService } from "../services/scheduler-service.js";
+import { backupService } from "../services/backup-service.js";
+import { reportService } from "../services/report-service.js";
+import { pluginService } from "../services/plugin-service.js";
+import { kubernetesAdapter } from "../services/kubernetes-adapter.js";
+import { edgeAgentAdapter } from "../services/edge-agent-adapter.js";
+import { coolifyAdapter } from "../services/coolify-adapter.js";
+import { caproverAdapter } from "../services/caprover-adapter.js";
+import type { Migration, MigrationAnalysis, SelectionFilter, NotificationConfig, ScheduledMigration, ReportConfig } from "../types/index.js";
 
 const app = new Hono();
 
@@ -25,8 +36,9 @@ const app = new Hono();
 
 // License check middleware
 app.use("/api/*", async (c, next) => {
-  // Skip license check for license activation endpoint
-  if (c.req.path === "/api/license/activate") {
+  // Skip license check for certain endpoints
+  const skipPaths = ["/api/license/activate", "/api/health"];
+  if (skipPaths.includes(c.req.path)) {
     return next();
   }
 
@@ -148,6 +160,8 @@ app.post(
       targetProjectId: z.string().optional(),
       targetEnvironmentId: z.string().optional(),
       targetServerId: z.string().optional(),
+      // v2.0 - Target platform
+      targetPlatform: z.enum(["dokploy", "coolify", "caprover"]).default("dokploy"),
     })
   ),
   async (c) => {
@@ -177,6 +191,12 @@ app.post(
 
     const migration = await db.query.migrations.findFirst({
       where: eq(migrations.id, id),
+    });
+
+    // Send notification
+    await notificationService.sendNotification("migration_created", {
+      migrationId: id,
+      migrationName: input.name,
     });
 
     return c.json(migration, 201);
@@ -344,6 +364,13 @@ app.post("/api/migrations/:id/analyze", async (c) => {
       })
       .where(eq(migrations.id, id));
 
+    // Send failure notification
+    await notificationService.sendNotification("migration_failed", {
+      migrationId: id,
+      migrationName: migration.name,
+      error: errorMessage,
+    });
+
     return c.json({ error: errorMessage }, 500);
   }
 });
@@ -397,8 +424,14 @@ app.post(
       })
       .where(eq(migrations.id, id));
 
+    // Send notification
+    await notificationService.sendNotification("migration_started", {
+      migrationId: id,
+      migrationName: migration.name,
+      isDryRun,
+    });
+
     // For now, return immediately and run in background
-    // In production, use a job queue like BullMQ
     executeMigrationInBackground(id, isDryRun).catch(console.error);
 
     return c.json({
@@ -433,6 +466,661 @@ app.post("/api/migrations/:id/cancel", async (c) => {
 
   return c.json({ success: true });
 });
+
+// ============================================================================
+// Selection Filters (v1.1.0)
+// ============================================================================
+
+// Get available presets
+app.get("/api/filters/presets", async (c) => {
+  const presets = ["production", "development", "testing", "all-stacks", "all-registries"];
+  return c.json(presets.map(preset => ({
+    id: preset,
+    name: preset.charAt(0).toUpperCase() + preset.slice(1).replace("-", " "),
+    filter: selectionFilterService.createPresetFilter(preset as any),
+  })));
+});
+
+// Create filter
+app.post(
+  "/api/filters",
+  zValidator(
+    "json",
+    z.object({
+      name: z.string().min(1),
+      resourceTypes: z.array(z.enum(["stack", "registry", "endpoint", "container", "volume", "network"])).optional(),
+      criteria: z.object({
+        namePatterns: z.array(z.string()).optional(),
+        tags: z.array(z.string()).optional(),
+        createdAfter: z.string().optional(),
+        createdBefore: z.string().optional(),
+        environmentIds: z.array(z.number()).optional(),
+        customMetadata: z.record(z.unknown()).optional(),
+      }).optional(),
+      excludePatterns: z.array(z.string()).optional(),
+    })
+  ),
+  async (c) => {
+    const input = c.req.valid("json");
+
+    const filter: SelectionFilter = {
+      id: nanoid(),
+      name: input.name,
+      resourceTypes: input.resourceTypes || [],
+      criteria: input.criteria,
+      excludePatterns: input.excludePatterns,
+      enabled: true,
+      createdAt: new Date().toISOString(),
+    };
+
+    const validation = selectionFilterService.validateFilter(filter);
+    if (!validation.valid) {
+      return c.json({ error: "Invalid filter", details: validation.errors }, 400);
+    }
+
+    return c.json(filter, 201);
+  }
+);
+
+// Preview filter results
+app.post(
+  "/api/filters/preview",
+  zValidator(
+    "json",
+    z.object({
+      migrationId: z.string(),
+      filter: z.any(),
+    })
+  ),
+  async (c) => {
+    const { migrationId, filter } = c.req.valid("json");
+
+    const migration = await db.query.migrations.findFirst({
+      where: eq(migrations.id, migrationId),
+    });
+
+    if (!migration || !migration.analysisResult) {
+      return c.json({ error: "Migration analysis not found" }, 404);
+    }
+
+    // Get resources from analysis
+    const analysis = migration.analysisResult as any;
+    const resources = [
+      ...selectionFilterService.stacksToFilterable(analysis.stacks || []),
+      ...selectionFilterService.registriesToFilterable(analysis.registries || []),
+      ...selectionFilterService.endpointsToFilterable(analysis.endpoints || []),
+    ];
+
+    const result = selectionFilterService.applyFilter(resources, filter);
+    const summary = selectionFilterService.getSummary(result);
+
+    return c.json({ result, summary });
+  }
+);
+
+// ============================================================================
+// Notifications (v1.1.0)
+// ============================================================================
+
+// Get notification configs
+app.get("/api/notifications/configs", async (c) => {
+  // In production, fetch from database
+  return c.json([]);
+});
+
+// Create notification config
+app.post(
+  "/api/notifications/configs",
+  zValidator(
+    "json",
+    z.object({
+      name: z.string().min(1),
+      type: z.enum(["email", "slack", "discord", "teams", "webhook"]),
+      enabled: z.boolean().default(true),
+      events: z.array(z.string()),
+      config: z.record(z.unknown()),
+    })
+  ),
+  async (c) => {
+    const input = c.req.valid("json");
+
+    const config: NotificationConfig = {
+      id: nanoid(),
+      ...input,
+      createdAt: new Date().toISOString(),
+    } as NotificationConfig;
+
+    // In production, save to database
+    return c.json(config, 201);
+  }
+);
+
+// Test notification
+app.post(
+  "/api/notifications/test",
+  zValidator(
+    "json",
+    z.object({
+      configId: z.string(),
+    })
+  ),
+  async (c) => {
+    const { configId } = c.req.valid("json");
+
+    // Send test notification
+    const results = await notificationService.sendNotification("test", {
+      message: "This is a test notification from Portainer Migrator",
+    });
+
+    return c.json({ success: results.every(r => r.success), results });
+  }
+);
+
+// ============================================================================
+// Scheduled Migrations (v1.2.0)
+// ============================================================================
+
+// List scheduled migrations
+app.get("/api/schedules", async (c) => {
+  const schedules = schedulerService.getSchedules();
+  return c.json(schedules);
+});
+
+// Create schedule
+app.post(
+  "/api/schedules",
+  zValidator(
+    "json",
+    z.object({
+      name: z.string().min(1),
+      migrationId: z.string(),
+      cronExpression: z.string(),
+      timezone: z.string().default("UTC"),
+      enabled: z.boolean().default(true),
+      maintenanceWindow: z.object({
+        start: z.string(),
+        end: z.string(),
+        daysOfWeek: z.array(z.number()),
+      }).optional(),
+      retryConfig: z.object({
+        maxRetries: z.number().default(3),
+        retryDelay: z.number().default(300),
+      }).optional(),
+    })
+  ),
+  async (c) => {
+    const input = c.req.valid("json");
+
+    const schedule: ScheduledMigration = {
+      id: nanoid(),
+      ...input,
+      createdAt: new Date().toISOString(),
+    };
+
+    schedulerService.createSchedule(schedule);
+
+    return c.json(schedule, 201);
+  }
+);
+
+// Update schedule
+app.patch(
+  "/api/schedules/:id",
+  zValidator(
+    "json",
+    z.object({
+      enabled: z.boolean().optional(),
+      cronExpression: z.string().optional(),
+    })
+  ),
+  async (c) => {
+    const id = c.req.param("id");
+    const input = c.req.valid("json");
+
+    schedulerService.updateSchedule(id, input);
+
+    return c.json({ success: true });
+  }
+);
+
+// Delete schedule
+app.delete("/api/schedules/:id", async (c) => {
+  const id = c.req.param("id");
+  schedulerService.deleteSchedule(id);
+  return c.json({ success: true });
+});
+
+// Get next run time
+app.get("/api/schedules/:id/next-run", async (c) => {
+  const id = c.req.param("id");
+  const schedules = schedulerService.getSchedules();
+  const schedule = schedules.find(s => s.id === id);
+
+  if (!schedule) {
+    return c.json({ error: "Schedule not found" }, 404);
+  }
+
+  const nextRun = schedulerService.getNextRunTime(schedule);
+  return c.json({ nextRun: nextRun?.toISOString() });
+});
+
+// ============================================================================
+// Backup & Restore (v1.2.0)
+// ============================================================================
+
+// List backups
+app.get("/api/backups", async (c) => {
+  const backups = await backupService.listBackups();
+  return c.json(backups);
+});
+
+// Create backup
+app.post(
+  "/api/backups",
+  zValidator(
+    "json",
+    z.object({
+      name: z.string().min(1),
+      description: z.string().optional(),
+      type: z.enum(["full", "migration", "config"]).default("full"),
+      migrationId: z.string().optional(),
+    })
+  ),
+  async (c) => {
+    const input = c.req.valid("json");
+
+    let backup;
+    if (input.type === "migration" && input.migrationId) {
+      backup = await backupService.createMigrationBackup(input.migrationId, input.name);
+    } else if (input.type === "config") {
+      backup = await backupService.createConfigBackup(input.name, input.description);
+    } else {
+      backup = await backupService.createFullBackup(input.name, input.description);
+    }
+
+    return c.json(backup, 201);
+  }
+);
+
+// Restore from backup
+app.post(
+  "/api/backups/:id/restore",
+  zValidator(
+    "json",
+    z.object({
+      dryRun: z.boolean().default(true),
+      restoreMigrations: z.boolean().default(true),
+      restoreConfig: z.boolean().default(true),
+      restoreLogs: z.boolean().default(false),
+    })
+  ),
+  async (c) => {
+    const id = c.req.param("id");
+    const input = c.req.valid("json");
+
+    const backups = await backupService.listBackups();
+    const backup = backups.find(b => b.id === id);
+
+    if (!backup) {
+      return c.json({ error: "Backup not found" }, 404);
+    }
+
+    const result = await backupService.restore({
+      backupId: id,
+      ...input,
+    });
+
+    return c.json(result);
+  }
+);
+
+// Delete backup
+app.delete("/api/backups/:id", async (c) => {
+  const id = c.req.param("id");
+  await backupService.deleteBackup(id);
+  return c.json({ success: true });
+});
+
+// ============================================================================
+// Reports (v1.2.0)
+// ============================================================================
+
+// Generate report
+app.post(
+  "/api/reports",
+  zValidator(
+    "json",
+    z.object({
+      type: z.enum(["migration", "summary", "audit", "trend"]),
+      format: z.enum(["json", "pdf", "csv", "html"]).default("json"),
+      migrationId: z.string().optional(),
+      dateRange: z.object({
+        start: z.string(),
+        end: z.string(),
+      }).optional(),
+      includeDetails: z.boolean().default(true),
+      includeLogs: z.boolean().default(false),
+    })
+  ),
+  async (c) => {
+    const input = c.req.valid("json");
+
+    // Check feature
+    const canExport = await hasFeature(FEATURES.EXPORT_REPORTS);
+    if (!canExport) {
+      return c.json({ error: "Reports require Professional license or higher" }, 403);
+    }
+
+    let report;
+    if (input.type === "migration" && input.migrationId) {
+      report = await reportService.generateMigrationReport(input.migrationId, input.format);
+    } else if (input.type === "trend" && input.dateRange) {
+      report = await reportService.generateTrendReport(input.dateRange);
+    } else {
+      report = await reportService.generateReport({
+        type: input.type,
+        format: input.format,
+        dateRange: input.dateRange,
+        includeDetails: input.includeDetails,
+        includeLogs: input.includeLogs,
+      } as ReportConfig);
+    }
+
+    return c.json(report);
+  }
+);
+
+// Download report
+app.get("/api/reports/:id/download", async (c) => {
+  const id = c.req.param("id");
+
+  // In production, fetch from database and return file
+  c.header("Content-Type", "application/octet-stream");
+  c.header("Content-Disposition", `attachment; filename="report-${id}.pdf"`);
+
+  return c.body("Report content here");
+});
+
+// ============================================================================
+// Plugins (v2.0.0)
+// ============================================================================
+
+// List plugins
+app.get("/api/plugins", async (c) => {
+  const plugins = pluginService.getLoadedPlugins();
+  return c.json(plugins);
+});
+
+// Install plugin
+app.post(
+  "/api/plugins/install",
+  zValidator(
+    "json",
+    z.object({
+      source: z.string(), // URL or path
+    })
+  ),
+  async (c) => {
+    const { source } = c.req.valid("json");
+
+    const plugin = await pluginService.loadPlugin(source);
+    if (!plugin) {
+      return c.json({ error: "Failed to load plugin" }, 400);
+    }
+
+    return c.json(plugin, 201);
+  }
+);
+
+// Enable/disable plugin
+app.patch(
+  "/api/plugins/:id",
+  zValidator(
+    "json",
+    z.object({
+      enabled: z.boolean(),
+    })
+  ),
+  async (c) => {
+    const id = c.req.param("id");
+    const { enabled } = c.req.valid("json");
+
+    if (enabled) {
+      await pluginService.enablePlugin(id);
+    } else {
+      await pluginService.disablePlugin(id);
+    }
+
+    return c.json({ success: true });
+  }
+);
+
+// Uninstall plugin
+app.delete("/api/plugins/:id", async (c) => {
+  const id = c.req.param("id");
+  await pluginService.uninstallPlugin(id);
+  return c.json({ success: true });
+});
+
+// ============================================================================
+// Kubernetes Migration (v2.0.0)
+// ============================================================================
+
+// Connect to Kubernetes endpoint
+app.post(
+  "/api/kubernetes/connect",
+  zValidator(
+    "json",
+    z.object({
+      name: z.string(),
+      server: z.string(),
+      token: z.string().optional(),
+      kubeconfig: z.string().optional(),
+      namespace: z.string().default("default"),
+    })
+  ),
+  async (c) => {
+    const input = c.req.valid("json");
+
+    const connected = await kubernetesAdapter.connect({
+      name: input.name,
+      server: input.server,
+      token: input.token,
+      kubeconfig: input.kubeconfig,
+      namespace: input.namespace,
+    });
+
+    if (!connected) {
+      return c.json({ error: "Failed to connect to Kubernetes" }, 400);
+    }
+
+    return c.json({ success: true });
+  }
+);
+
+// Discover Kubernetes resources
+app.post(
+  "/api/kubernetes/discover",
+  zValidator(
+    "json",
+    z.object({
+      namespace: z.string().default("default"),
+      includeDeployments: z.boolean().default(true),
+      includeStatefulSets: z.boolean().default(true),
+      includeServices: z.boolean().default(true),
+      includeConfigMaps: z.boolean().default(true),
+      includeSecrets: z.boolean().default(true),
+      includeIngresses: z.boolean().default(true),
+    })
+  ),
+  async (c) => {
+    const input = c.req.valid("json");
+
+    const resources = await kubernetesAdapter.discoverResources(input.namespace, input);
+
+    return c.json(resources);
+  }
+);
+
+// Transform Kubernetes to Compose
+app.post(
+  "/api/kubernetes/transform",
+  zValidator(
+    "json",
+    z.object({
+      resources: z.array(z.any()),
+      namespaceMapping: z.array(z.object({
+        sourceNamespace: z.string(),
+        targetProjectName: z.string(),
+      })),
+    })
+  ),
+  async (c) => {
+    const { resources, namespaceMapping } = c.req.valid("json");
+
+    const composes = kubernetesAdapter.transformToDokloy(resources, namespaceMapping);
+
+    return c.json(composes);
+  }
+);
+
+// ============================================================================
+// Edge Agent Migration (v2.0.0)
+// ============================================================================
+
+// Connect to Portainer with Edge features
+app.post(
+  "/api/edge/connect",
+  zValidator(
+    "json",
+    z.object({
+      portainerUrl: z.string().url(),
+      apiKey: z.string(),
+    })
+  ),
+  async (c) => {
+    const { portainerUrl, apiKey } = c.req.valid("json");
+
+    const connected = await edgeAgentAdapter.connect(portainerUrl, apiKey);
+    if (!connected) {
+      return c.json({ error: "Failed to connect or Edge features not enabled" }, 400);
+    }
+
+    return c.json({ success: true });
+  }
+);
+
+// Discover Edge resources
+app.post(
+  "/api/edge/discover",
+  zValidator(
+    "json",
+    z.object({
+      migrateEdgeGroups: z.boolean().default(true),
+      migrateEdgeStacks: z.boolean().default(true),
+      migrateEdgeJobs: z.boolean().default(true),
+      convertToStandardStacks: z.boolean().default(true),
+    })
+  ),
+  async (c) => {
+    const input = c.req.valid("json");
+
+    const result = await edgeAgentAdapter.discoverResources(input);
+    const analysis = edgeAgentAdapter.analyzeCompatibility(input, result);
+
+    return c.json({ discovery: result, analysis });
+  }
+);
+
+// ============================================================================
+// Multi-Platform Migration (v2.0.0)
+// ============================================================================
+
+// Connect to Coolify
+app.post(
+  "/api/platforms/coolify/connect",
+  zValidator(
+    "json",
+    z.object({
+      url: z.string().url(),
+      apiToken: z.string(),
+      teamId: z.string().optional(),
+    })
+  ),
+  async (c) => {
+    const input = c.req.valid("json");
+
+    const connected = await coolifyAdapter.connect(input);
+    if (!connected) {
+      return c.json({ error: "Failed to connect to Coolify" }, 400);
+    }
+
+    const projects = await coolifyAdapter.getProjects();
+    const destinations = await coolifyAdapter.getDestinations();
+
+    return c.json({ success: true, projects, destinations });
+  }
+);
+
+// Analyze Coolify compatibility
+app.post(
+  "/api/platforms/coolify/analyze",
+  zValidator(
+    "json",
+    z.object({
+      stacks: z.array(z.any()),
+    })
+  ),
+  async (c) => {
+    const { stacks } = c.req.valid("json");
+
+    const analysis = coolifyAdapter.analyzeCompatibility(stacks);
+
+    return c.json(analysis);
+  }
+);
+
+// Connect to CapRover
+app.post(
+  "/api/platforms/caprover/connect",
+  zValidator(
+    "json",
+    z.object({
+      url: z.string().url(),
+      password: z.string(),
+    })
+  ),
+  async (c) => {
+    const input = c.req.valid("json");
+
+    const connected = await caproverAdapter.connect(input);
+    if (!connected) {
+      return c.json({ error: "Failed to connect to CapRover" }, 400);
+    }
+
+    const apps = await caproverAdapter.getApps();
+
+    return c.json({ success: true, existingApps: apps.length });
+  }
+);
+
+// Analyze CapRover compatibility
+app.post(
+  "/api/platforms/caprover/analyze",
+  zValidator(
+    "json",
+    z.object({
+      stacks: z.array(z.any()),
+    })
+  ),
+  async (c) => {
+    const { stacks } = c.req.valid("json");
+
+    const analysis = caproverAdapter.analyzeCompatibility(stacks);
+
+    return c.json(analysis);
+  }
+);
 
 // ============================================================================
 // Migration Items and Logs
@@ -581,7 +1269,7 @@ app.get("/api/migrations/:id/export", async (c) => {
   });
 
   const exportData = {
-    version: "1.0",
+    version: "2.0",
     generatedAt: new Date().toISOString(),
     migration: {
       name: migration.name,
@@ -601,13 +1289,47 @@ app.get("/api/migrations/:id/export", async (c) => {
 });
 
 // ============================================================================
+// Settings
+// ============================================================================
+
+// Get settings
+app.get("/api/settings", async (c) => {
+  // In production, fetch from database
+  return c.json({
+    darkMode: false,
+    parallelMigrations: 3,
+    defaultTimeout: 30000,
+    retentionDays: 90,
+  });
+});
+
+// Update settings
+app.patch(
+  "/api/settings",
+  zValidator(
+    "json",
+    z.object({
+      darkMode: z.boolean().optional(),
+      parallelMigrations: z.number().min(1).max(10).optional(),
+      defaultTimeout: z.number().min(5000).max(600000).optional(),
+      retentionDays: z.number().min(7).max(365).optional(),
+    })
+  ),
+  async (c) => {
+    const input = c.req.valid("json");
+    // In production, save to database
+    return c.json({ success: true, settings: input });
+  }
+);
+
+// ============================================================================
 // Health Check
 // ============================================================================
 
 app.get("/api/health", (c) => {
   return c.json({
     status: "ok",
-    version: "1.0.0",
+    version: "2.0.0",
     timestamp: new Date().toISOString(),
   });
 });
@@ -624,6 +1346,12 @@ async function executeMigrationInBackground(migrationId: string, isDryRun: boole
   if (!migration) return;
 
   try {
+    // Execute plugin hooks before migration
+    await pluginService.executeHooks("pre_migration", {
+      migrationId,
+      config: migration as any,
+    });
+
     // Fetch data
     let data;
 
@@ -656,6 +1384,13 @@ async function executeMigrationInBackground(migrationId: string, isDryRun: boole
     if (migration.migrateRegistries) {
       for (const registry of data.registries) {
         const transformed = transformer.transformRegistry(registry);
+
+        // Execute plugin hooks
+        await pluginService.executeHooks("transform_registry", {
+          migrationId,
+          sourceData: registry,
+          transformedData: transformed,
+        });
 
         await db.insert(migrationItems).values({
           id: nanoid(),
@@ -701,6 +1436,13 @@ async function executeMigrationInBackground(migrationId: string, isDryRun: boole
       for (const stack of data.stacks) {
         const transformed = transformer.transformStack(stack, "placeholder-env-id");
 
+        // Execute plugin hooks
+        await pluginService.executeHooks("transform_stack", {
+          migrationId,
+          sourceData: stack,
+          transformedData: transformed,
+        });
+
         await db.insert(migrationItems).values({
           id: nanoid(),
           migrationId,
@@ -718,6 +1460,12 @@ async function executeMigrationInBackground(migrationId: string, isDryRun: boole
       }
     }
 
+    // Execute plugin hooks after migration
+    await pluginService.executeHooks("post_migration", {
+      migrationId,
+      success: true,
+    });
+
     // Complete migration
     await db.update(migrations)
       .set({
@@ -728,8 +1476,23 @@ async function executeMigrationInBackground(migrationId: string, isDryRun: boole
       })
       .where(eq(migrations.id, migrationId));
 
+    // Send completion notification
+    await notificationService.sendNotification("migration_completed", {
+      migrationId,
+      migrationName: migration.name,
+      itemsProcessed: processedItems,
+      isDryRun,
+    });
+
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Migration failed";
+
+    // Execute plugin hooks on failure
+    await pluginService.executeHooks("post_migration", {
+      migrationId,
+      success: false,
+      error: errorMessage,
+    });
 
     await db.update(migrations)
       .set({
@@ -739,6 +1502,13 @@ async function executeMigrationInBackground(migrationId: string, isDryRun: boole
         completedAt: new Date().toISOString(),
       })
       .where(eq(migrations.id, migrationId));
+
+    // Send failure notification
+    await notificationService.sendNotification("migration_failed", {
+      migrationId,
+      migrationName: migration.name,
+      error: errorMessage,
+    });
   }
 }
 

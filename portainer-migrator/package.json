@@ -1,14 +1,18 @@
 {
   "name": "portainer-migrator",
-  "version": "1.0.0",
-  "description": "Migrate from Portainer to Dokploy with ease - supports API and BoltDB migration methods",
+  "version": "2.0.0",
+  "description": "Migrate from Portainer to Dokploy, Coolify, or CapRover - supports API and BoltDB migration methods",
   "main": "dist/index.js",
+  "bin": {
+    "portainer-migrator": "./dist/cli/index.js"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc && npm run build:frontend",
     "build:backend": "tsc",
     "build:frontend": "cd frontend && npm run build",
     "start": "node dist/index.js",
+    "cli": "tsx src/cli/index.ts",
     "test": "vitest",
     "test:coverage": "vitest --coverage",
     "lint": "eslint src --ext .ts",
@@ -21,8 +25,11 @@
   "keywords": [
     "portainer",
     "dokploy",
+    "coolify",
+    "caprover",
     "migration",
     "docker",
+    "kubernetes",
     "containers",
     "devops"
   ],
@@ -31,15 +38,26 @@
   "dependencies": {
     "@hono/node-server": "^1.12.0",
     "@hono/zod-validator": "^0.2.2",
+    "@inquirer/prompts": "^5.0.0",
     "better-sqlite3": "^11.3.0",
+    "chalk": "^5.3.0",
+    "cli-table3": "^0.6.5",
+    "commander": "^12.1.0",
+    "cron-parser": "^4.9.0",
     "drizzle-orm": "^0.33.0",
     "hono": "^4.5.0",
     "nanoid": "^5.0.7",
+    "nodemailer": "^6.9.14",
+    "ora": "^8.0.1",
+    "pdfkit": "^0.15.0",
+    "yaml": "^2.5.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^22.0.0",
+    "@types/nodemailer": "^6.4.15",
+    "@types/pdfkit": "^0.13.4",
     "drizzle-kit": "^0.24.0",
     "tsx": "^4.16.0",
     "typescript": "^5.5.0",
