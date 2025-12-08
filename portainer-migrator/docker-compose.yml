@@ -1,0 +1,58 @@
+# Portainer Migrator - Docker Compose Configuration
+# Use this for local development and deployment
+
+version: '3.8'
+
+services:
+  portainer-migrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: portainer-migrator:latest
+    container_name: portainer-migrator
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3001}:3001"
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - PORT=3001
+      - HOST=0.0.0.0
+      - DATABASE_PATH=/app/data/migrator.db
+      - LICENSE_KEY=${LICENSE_KEY:-}
+      - LICENSE_SERVER_URL=${LICENSE_SERVER_URL:-}
+      - DOKPLOY_URL=${DOKPLOY_URL:-}
+      - DOKPLOY_API_KEY=${DOKPLOY_API_KEY:-}
+      - JWT_SECRET=${JWT_SECRET:-change-this-secret-in-production-minimum-32-characters}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - ENABLE_TELEMETRY=${ENABLE_TELEMETRY:-false}
+    volumes:
+      # Persistent data storage
+      - migrator-data:/app/data
+      # Optional: Mount Portainer data for BoltDB migration
+      # - /path/to/portainer/data:/portainer-data:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - migrator-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.portainer-migrator.rule=Host(`migrate.${DOMAIN:-localhost}`)"
+      - "traefik.http.routers.portainer-migrator.entrypoints=websecure"
+      - "traefik.http.routers.portainer-migrator.tls.certresolver=letsencrypt"
+      - "traefik.http.services.portainer-migrator.loadbalancer.server.port=3001"
+
+volumes:
+  migrator-data:
+    driver: local
+
+networks:
+  migrator-network:
+    driver: bridge
+
+# Development override
+# Create docker-compose.override.yml for local development settings
